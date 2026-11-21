@@ -106,6 +106,10 @@ async def collect(client: Client, **kwargs: Any) -> list[Any]:
     return list(iterator)
 
 
+async def next_item(iterator: Any) -> Any:
+    return await anext(iterator) if hasattr(iterator, "__anext__") else next(iterator)
+
+
 class Clock:
     def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.now = 100.0
@@ -1737,6 +1741,123 @@ async def test_cursor_pagination_preserves_filters_and_refuses_cycles_or_bounds(
             with pytest.raises(ProoflineError) as raised:
                 await collect(client, max_items=1, filters={"cursor": "initial"})
             assert raised.value.type == "urn:proofline:sdk:pagination-limit"
+
+
+@MODES
+async def test_pull_request_review_iterator_preserves_filters_and_is_lazy(mode: str) -> None:
+    def respond(request: Request, index: int) -> Reply:
+        assert urlsplit(request.path).path == (
+            f"/api/v1/organizations/{ORG}/reviews/pr/repo%2Fname/42"
+        )
+        assert request.headers["Authorization"] == f"Bearer {TOKEN}"
+        query = parse_qs(urlsplit(request.path).query)
+        assert query["status"] == ["COMPLETED"]
+        assert query["query"] == [STRUCTURED_QUERY]
+        assert query["search"] == ["text & space"]
+        assert query["limit"] == ["2"]
+        assert query["cursor"] == ["resume/+cursor" if index == 0 else "next/+cursor"]
+        body = page(cursor="next/+cursor" if index == 0 else None, truncated=index == 0)
+        body["items"][0]["id"] = str(REVIEW if index == 0 else ASSESSMENT)
+        return Reply(body=body)
+
+    with Server(respond) as server:
+        async with session(mode, server.url) as client:
+            iterator = client.iter_pull_request_reviews(
+                ORG,
+                "repo/name",
+                42,
+                page_size=2,
+                max_pages=2,
+                filters={
+                    "status": "COMPLETED",
+                    "query": STRUCTURED_QUERY,
+                    "search": "text & space",
+                    "cursor": "resume/+cursor",
+                },
+            )
+            assert not server.requests
+            first = await next_item(iterator)
+            assert first.id == REVIEW
+            assert len(server.requests) == 1
+            second = await next_item(iterator)
+            assert second.id == ASSESSMENT
+            assert len(server.requests) == 2
+            if mode == "sync":
+                with pytest.raises(StopIteration):
+                    next(iterator)
+            else:
+                with pytest.raises(StopAsyncIteration):
+                    await anext(iterator)
+        assert len(server.requests) == 2
+
+
+@MODES
+async def test_pull_request_review_iterator_refuses_bad_cursors_and_bounds(mode: str) -> None:
+    failures = {
+        "empty": (None, ""),
+        "resume": ("resume", "resume"),
+        "repeat": (None, "next"),
+    }
+    for failure, (initial, next_cursor) in failures.items():
+        def respond(request: Request, index: int, cursor: str = next_cursor) -> Reply:
+            return Reply(body=page(cursor=cursor, truncated=True))
+
+        with Server(respond) as server:
+            async with session(mode, server.url) as client:
+                iterator = client.iter_pull_request_reviews(
+                    ORG,
+                    "repo/name",
+                    42,
+                    filters={"cursor": initial} if initial is not None else None,
+                )
+                if failure == "repeat":
+                    await next_item(iterator)
+                    with pytest.raises(ProoflineError) as raised:
+                        await next_item(iterator)
+                    assert len(server.requests) == 2
+                else:
+                    with pytest.raises(ProoflineError) as raised:
+                        await next_item(iterator)
+                    assert len(server.requests) == 1
+                assert raised.value.type == "urn:proofline:sdk:invalid-pagination"
+
+    with Server(
+        lambda request, index: Reply(body=page(cursor=f"cursor-{index}", truncated=True))
+    ) as server:
+        async with session(mode, server.url) as client:
+            iterator = client.iter_pull_request_reviews(
+                ORG, "repo/name", 42, max_pages=1
+            )
+            await next_item(iterator)
+            with pytest.raises(ProoflineError) as raised:
+                await next_item(iterator)
+            assert raised.value.type == "urn:proofline:sdk:pagination-limit"
+        assert len(server.requests) == 1
+
+    two_items = page()
+    two_items["items"].append(dict(two_items["items"][0]))
+    with Server(lambda request, index: Reply(body=two_items)) as server:
+        async with session(mode, server.url) as client:
+            iterator = client.iter_pull_request_reviews(
+                ORG, "repo/name", 42, max_items=1
+            )
+            await next_item(iterator)
+            with pytest.raises(ProoflineError) as raised:
+                await next_item(iterator)
+            assert raised.value.type == "urn:proofline:sdk:pagination-limit"
+        assert len(server.requests) == 1
+
+
+@MODES
+async def test_pull_request_review_iterator_validates_limits_before_requests(mode: str) -> None:
+    with Server(lambda request, index: Reply(body={})) as server:
+        async with session(mode, server.url) as client:
+            iterator = client.iter_pull_request_reviews(
+                ORG, "repo/name", 42, page_size=0
+            )
+            with pytest.raises(ValueError, match="Pagination requires"):
+                await next_item(iterator)
+        assert not server.requests
 
 
 def test_token_environment_and_https_origin_rejection(monkeypatch: pytest.MonkeyPatch) -> None:

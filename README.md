@@ -55,6 +55,28 @@ if outcome.status != "COMPLETED":
 
 `head_commit_sha` is a full SHA of 40 or 64 hexadecimal characters; any other value raises `ValueError` before a request. A review pinned to another head ends the wait on the read that names it. Its outcome is `INCOMPLETE` whatever the review's own status, its last gap has the reason code `HEAD_COMMIT_MISMATCH`, and `reason` says that the review is pinned to another head commit. A settled review that names no head has `HEAD_COMMIT_UNAVAILABLE` instead and is not `COMPLETED` either. `outcome.review.head_commit_sha` is the commit the review is pinned to. A patch review's head is a derived revision ID, so no commit matches it. In a GitHub Actions `pull_request` job, `GITHUB_SHA` is the merge commit; pass the pull request's head.
 
+## Per-pull-request review history
+
+Use `iter_pull_request_reviews` to traverse every review run for one pull request. It is separate from `iter_reviews`, which lists the latest review run for each pull request.
+
+```python
+import os
+from uuid import UUID
+from proofline import ProoflineClient
+
+organization_id = UUID(os.environ["PROOFLINE_ORGANIZATION_ID"])
+with ProoflineClient() as client:
+    for review in client.iter_pull_request_reviews(
+        organization_id,
+        "owner/repository",
+        42,
+        filters={"status": "COMPLETED"},
+    ):
+        print(review.id, review.status)
+```
+
+The async client exposes the same iterator for use with `async for`. Both versions preserve the repository, pull request number, filters, and opaque cursors across requests. Iteration is lazy and bounded to 100 pages and 10,000 items by default; set `page_size`, `max_pages`, and `max_items` to adjust those limits. Empty, repeated, or cyclic continuation cursors raise `ProoflineError`, and exhausting a bound raises `urn:proofline:sdk:pagination-limit` rather than silently returning an incomplete history.
+
 ## Review exports
 
 `export_reviews` reads one CSV or NDJSON page over the bounded transport. Export tokens require `analytics:read`.
